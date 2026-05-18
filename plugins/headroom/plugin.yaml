@@ -1,0 +1,7 @@
+name: headroom
+version: 1.0.0
+description: "Compress context tokens using Headroom — reduces boilerplate in tool calls, DB queries, file reads, and RAG retrievals before sending to LLM."
+author: "Gregor, Headroom Labs"
+hooks:
+  - pre_api_request
+  - post_api_request
