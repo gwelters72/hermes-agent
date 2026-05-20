@@ -1,7 +1,4 @@
 name: headroom
-version: 1.0.0
-description: "Compress context tokens using Headroom — reduces boilerplate in tool calls, DB queries, file reads, and RAG retrievals before sending to LLM."
-author: "Gregor, Headroom Labs"
-hooks:
-  - pre_api_request
-  - post_api_request
+version: 1.1.0
+description: "Headroom proxy integration — session-start health check, CCR hint injection before LLM calls, and /headroom status command. Reproduces the headroom-ai Claude Code plugin for Hermes."
+author: "Gregor"

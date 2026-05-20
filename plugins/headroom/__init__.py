@@ -1,154 +1,149 @@
-"""Headroom plugin — compress context tokens before API requests.
+"""Headroom plugin for Hermes Agent.
 
-Headroom (headroomlabs.ai) compresses boilerplate in tool calls, DB queries,
-file reads, and RAG retrievals — achieving 70-95% token reduction while
-preserving answer quality. Same answers, fraction of the tokens.
+Reproduces the headroom-ai integration from Claude Code:
 
-This plugin integrates the Headroom compressor into Hermes Agent via:
-1. pre_api_request hook — intercepts messages, compresses them
-2. post_api_request hook — logs compression stats
-3. /headroom slash command — status, toggle, metrics
+1. on_session_start  — health-check the headroom proxy; warn if unreachable
+2. pre_llm_call      — inject a one-line CCR reminder so the LLM knows to call
+                       headroom_retrieve when it encounters <<ccr:...>> markers
+3. /headroom command — status, enable/disable CCR reminder injection
 
-All compression is transparent to the agent and user.
+The proxy itself (http://127.0.0.1:8787) handles compression and CCR marker
+insertion.  This plugin only ensures the agent uses it correctly.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, Optional
+import urllib.error
+import urllib.request
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_ENABLED = True  # Toggle via /headroom command
-_STATS = {"compressed": 0, "total": 0, "tokens_saved": 0}
+_PROXY_URL = "http://127.0.0.1:8787"
+_INJECT_ENABLED = True
+
+_CCR_HINT = (
+    "Note: tool results may contain <<ccr:HASH>> compression markers. "
+    "Call headroom_retrieve(hash=HASH) to get the original content."
+)
 
 
-def _get_headroom_compress():
-    """Lazy-import headroom.compress. Returns None if not installed."""
+# ---------------------------------------------------------------------------
+# Proxy health check
+# ---------------------------------------------------------------------------
+
+def _proxy_health() -> Optional[dict]:
+    """GET /health from the headroom proxy. Returns parsed JSON or None."""
     try:
-        from headroom import compress
-        return compress
-    except ImportError:
+        req = urllib.request.Request(f"{_PROXY_URL}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
+    except Exception:
         return None
 
 
-def _on_pre_api_request(
-    provider: str = "",
-    model: str = "",
-    messages: Optional[list] = None,
-    **_: Any,
-) -> Optional[Dict[str, Any]]:
-    """Compress messages before API request if headroom is enabled."""
-    if not _ENABLED or not messages:
-        return None
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
 
-    compress = _get_headroom_compress()
-    if not compress:
-        logger.warning("Headroom not installed. Install: pip install headroom-ai[all]")
-        return None
-
-    try:
-        # Headroom compress() returns result with .messages and .stats
-        result = compress(messages, model=model)
-
-        _STATS["total"] += 1
-        if hasattr(result, "messages") and result.messages:
-            _STATS["compressed"] += 1
-            # Try to extract token savings if available
-            if hasattr(result, "stats") and result.stats:
-                if "tokens_saved" in result.stats:
-                    _STATS["tokens_saved"] += result.stats["tokens_saved"]
-
-            logger.debug(
-                f"[Headroom] Compressed {len(messages)} messages → "
-                f"{len(result.messages)} (model={model})"
-            )
-            return {"messages": result.messages}
-    except Exception as e:
-        logger.warning(f"Headroom compression failed: {e}")
-        return None
-
-    return None
-
-
-def _on_post_api_request(
-    provider: str = "",
-    model: str = "",
-    response: Any = None,
-    **_: Any,
-) -> None:
-    """Log API request completion (for metrics)."""
-    if not _ENABLED:
+def _on_session_start(**_: Any) -> None:
+    """Check headroom proxy health at session start."""
+    health = _proxy_health()
+    if health is None:
+        logger.warning(
+            "[headroom] Proxy at %s is unreachable — compression disabled. "
+            "Start it with: cd ~/mcpserver && docker compose up -d headroom",
+            _PROXY_URL,
+        )
         return
-    # Placeholder for future post-processing (e.g., decompression stats)
+
+    status = health.get("status", "unknown")
+    version = health.get("version", "?")
+    uptime = int(health.get("uptime_seconds", 0))
+    compress = health.get("runtime", {}).get("anthropic_pre_upstream", {}).get("enabled", False)
+
+    logger.info(
+        "[headroom] Proxy v%s — status=%s uptime=%ds compression=%s",
+        version, status, uptime, "on" if compress else "off",
+    )
+
+    if status != "healthy":
+        logger.warning("[headroom] Proxy reports status=%s", status)
+
+
+def _on_pre_llm_call(**kwargs: Any) -> Optional[str]:
+    """Inject a CCR reminder into the user message when enabled."""
+    if not _INJECT_ENABLED:
+        return None
+    return _CCR_HINT
 
 
 # ---------------------------------------------------------------------------
-# Slash command
+# /headroom slash command
 # ---------------------------------------------------------------------------
 
-_HELP_TEXT = """\
-/headroom — Headroom context compression
-
-Subcommands:
-  status          Show compression stats and toggle status
-  enable          Turn compression on
-  disable         Turn compression off
-  reset-stats     Reset compression counters
-
-Headroom compresses boilerplate in tool calls, DB queries, file reads,
-and RAG retrievals — achieving 70–95% reduction while preserving answers.
-
-Install: pip install headroom-ai[all]
-Docs: https://headroomlabs.ai/docs
-"""
-
-
-def _handle_slash(raw_args: str) -> Optional[str]:
-    global _ENABLED, _STATS
+def _handle_slash(raw_args: str) -> str:
+    global _INJECT_ENABLED
 
     argv = raw_args.strip().split()
     sub = argv[0] if argv else "status"
 
-    if sub in ("help", "-h", "--help"):
-        return _HELP_TEXT
-
-    if sub == "status":
-        status = "✓ Enabled" if _ENABLED else "✗ Disabled"
-        return (
-            f"Headroom compression is {status}\n"
-            f"Requests: {_STATS['total']}\n"
-            f"Compressed: {_STATS['compressed']}\n"
-            f"Tokens saved: {_STATS['tokens_saved']:,}"
-        )
+    if sub in ("status", ""):
+        health = _proxy_health()
+        if health is None:
+            proxy_line = f"Proxy {_PROXY_URL}: UNREACHABLE"
+        else:
+            v = health.get("version", "?")
+            s = health.get("status", "?")
+            uptime = int(health.get("uptime_seconds", 0))
+            compress = health.get("runtime", {}).get(
+                "anthropic_pre_upstream", {}
+            ).get("enabled", False)
+            proxy_line = (
+                f"Proxy {_PROXY_URL}: {s} | v{v} | uptime {uptime}s | "
+                f"compression {'ON' if compress else 'OFF'}"
+            )
+        inject_line = f"CCR hint injection: {'enabled' if _INJECT_ENABLED else 'disabled'}"
+        return f"{proxy_line}\n{inject_line}"
 
     if sub == "enable":
-        _ENABLED = True
-        return "✓ Headroom compression enabled"
+        _INJECT_ENABLED = True
+        return "CCR hint injection enabled."
 
     if sub == "disable":
-        _ENABLED = False
-        return "✗ Headroom compression disabled"
+        _INJECT_ENABLED = False
+        return "CCR hint injection disabled."
 
-    if sub == "reset-stats":
-        _STATS = {"compressed": 0, "total": 0, "tokens_saved": 0}
-        return "Stats reset"
+    if sub == "health":
+        health = _proxy_health()
+        if health is None:
+            return f"Proxy {_PROXY_URL} is not reachable."
+        return json.dumps(health, indent=2)
 
-    return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
+    return (
+        "Usage: /headroom [status|enable|disable|health]\n"
+        "  status   — proxy health + injection state (default)\n"
+        "  enable   — enable CCR hint injection before each LLM call\n"
+        "  disable  — disable CCR hint injection\n"
+        "  health   — raw proxy /health JSON"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Plugin registration
+# Registration
 # ---------------------------------------------------------------------------
 
-def register(ctx) -> None:
-    """Register Headroom plugin hooks and slash command."""
-    ctx.register_hook("pre_api_request", _on_pre_api_request)
-    ctx.register_hook("post_api_request", _on_post_api_request)
+def register(ctx: Any) -> None:
+    ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_command(
         "headroom",
         handler=_handle_slash,
-        description="Compress context tokens using Headroom before API requests.",
+        description="Headroom proxy status and CCR hint injection control.",
     )
-    logger.info("Headroom plugin registered (compression %s)",
-                "enabled" if _ENABLED else "disabled")
+    logger.info("[headroom] plugin registered (proxy=%s)", _PROXY_URL)
+
+
+__all__ = ["register"]

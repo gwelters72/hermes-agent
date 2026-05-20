@@ -111,6 +111,16 @@ class SequentialController:
 
     def before_agent_step(self, session_id="", model="", **kwargs):
         # Wird bei 'pre_llm_call' aufgerufen
+        # Stale lock guard: falls ein vorheriger Call nie nach_agent_step bekam, jetzt freigeben
+        with _LOCK_MAP_LOCK:
+            stale_key = (session_id, "llm", "llm")
+            if stale_key in _ACTIVE_LOCKS:
+                try:
+                    _ACTIVE_LOCKS.pop(stale_key).release()
+                    if DEBUG:
+                        print(f"[SEQ] stale lock released for session={session_id}")
+                except RuntimeError:
+                    pass
         self._acquire(session_id, "llm", model, "llm")
         return None
 

@@ -1,4 +1,4 @@
-"""Example dashboard plugin — backend API routes.
+ """Example dashboard plugin — backend API routes.
 
 Mounted at /api/plugins/example/ by the dashboard plugin system.
 
