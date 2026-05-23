@@ -1,5 +1,0 @@
-name: sequential-model
-version: 1.0.0
-description: Erzwingt sequentielle Tool-Ausführung und optimiert die CPU/GPU-Auslastung.
-author: gwelters72
-entry_point: sequential_model.py
