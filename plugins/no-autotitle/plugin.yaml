@@ -1,0 +1,6 @@
+name: no-autotitle
+version: 1.0.0
+description: "Disable automatic session title generation (suppresses background auxiliary LLM calls after the first exchange)."
+author: "gregor"
+kind: standalone
+hooks: []
