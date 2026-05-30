@@ -1,0 +1,4 @@
+name: gpu_sync_enforcer
+version: 1.0.0
+description: "Erzwingt sequentielle GPU-Nutzung für lokale LLM-Endpunkte via Global Lock."
+author: "Gregor"
