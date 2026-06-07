@@ -1993,6 +1993,15 @@ def _run_browser_command(
 
         browser_env = {**os.environ}
 
+        # Prevent 'X11 connection rejected because of wrong authentication'
+        # errors in network_mode: host or when DISPLAY is leaked from the host
+        # into the container. Most Docker environments don't have X11/Xauthority
+        # correctly mapped; unsetting DISPLAY forces Chromium to remain truly
+        # headless and not attempt an unauthenticated connection.
+        if _running_in_docker() and "DISPLAY" in browser_env:
+            logger.debug("browser: unsetting DISPLAY in Docker to prevent X11 auth errors")
+            browser_env.pop("DISPLAY", None)
+
         # Ensure subprocesses inherit the same browser-specific PATH fallbacks
         # used during CLI discovery.
         browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))

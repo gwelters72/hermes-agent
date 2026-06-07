@@ -357,15 +357,31 @@ class ByteRoverMemoryProvider(MemoryProvider):
         if not content:
             return tool_error("content is required")
 
+        # Use --detach to avoid blocking on local LLM inference.
+        # Without detach, brv curate waits for the model to process,
+        # which can exceed the timeout when parallel requests compete
+        # for the same llama-server instance.
         result = _run_brv(
-            ["curate", "--", content],
-            timeout=_CURATE_TIMEOUT, cwd=self._cwd,
+            ["curate", "--detach", "--", content],
+            timeout=10, cwd=self._cwd,
         )
 
         if not result["success"]:
             return tool_error(result.get("error", "Curate failed"))
 
-        return json.dumps({"result": "Memory curated successfully."})
+        # Parse the queued response to extract task info for the user
+        try:
+            data = json.loads(result["output"])
+            task_id = data.get("taskId", "")
+            log_id = data.get("data", {}).get("logId", "")
+            status = data.get("status", "queued")
+            return json.dumps({
+                "result": f"Memory queued for curation (task: {task_id}, status: {status}).",
+                "taskId": task_id,
+                "logId": log_id,
+            })
+        except (json.JSONDecodeError, AttributeError):
+            return json.dumps({"result": "Memory queued for curation."})
 
     def _tool_status(self) -> str:
         result = _run_brv(["status"], timeout=15, cwd=self._cwd)

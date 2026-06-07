@@ -1,0 +1,4 @@
+name: starwrite_redaction_fix
+version: 1.0.0
+description: "Verhindert, dass der Secret-Redactor Datei-/Code-Inhalte mit *** zerstoert (Bearer ***, KEY=***). Wrappt redact_sensitive_text nur fuer write_file/execute_code/patch-Argumente; Terminal-Secret-Redaction bleibt intakt."
+author: "Gregor"
