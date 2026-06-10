@@ -13,11 +13,32 @@ export interface ImageAttachResponse {
   path?: string
   text?: string
   message?: string
+  // Returned by the byte-upload variant (image.attach_bytes) used in remote mode.
+  count?: number
+  bytes?: number
+  name?: string
+  width?: number
+  height?: number
+  token_estimate?: number
 }
 
 export interface ImageDetachResponse {
   detached?: boolean
   count?: number
+}
+
+export interface FileAttachResponse {
+  attached?: boolean
+  message?: string
+  // Gateway-side absolute path the file was staged to.
+  path?: string
+  // Workspace-relative path used to build ref_text.
+  ref_path?: string
+  // Rewritten @file: ref that resolves on the gateway (workspace-relative).
+  ref_text?: string
+  // True when bytes/host file were copied into the session workspace.
+  uploaded?: boolean
+  name?: string
 }
 
 export interface SlashExecResponse {
@@ -82,6 +103,12 @@ export interface ClientSessionState {
   messages: ChatMessage[]
   branch: string
   cwd: string
+  model: string
+  provider: string
+  reasoningEffort: string
+  serviceTier: string
+  fast: boolean
+  yolo: boolean
   busy: boolean
   awaitingResponse: boolean
   streamId: string | null
