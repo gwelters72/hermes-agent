@@ -196,6 +196,15 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
+        # Live-output sink set by a driver (e.g. the desktop gateway): called from
+        # reader threads with (session, chunk) to stream output to a UI in
+        # real time, instead of polling the output tail.
+        self.on_output = None
+        # Close-view sink set by a driver (desktop gateway): called with
+        # (session_or_none, process_id) when the agent asks to close a read-only
+        # terminal tab. Distinct from kill — the process keeps running; only the
+        # UI view is dropped (the user can reopen it from the status stack).
+        self.on_close = None
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -204,6 +213,17 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def _emit_output(self, session: ProcessSession, chunk: str) -> None:
+        """Forward a freshly-read chunk to the live-output sink, if one is set.
+        Called from reader threads; never raise into the read loop."""
+        sink = self.on_output
+        if sink is None or not chunk:
+            return
+        try:
+            sink(session, chunk)
+        except Exception:
+            pass
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -901,13 +921,33 @@ class ProcessRegistry:
     # ----- Reader / Poller Threads -----
 
     def _reader_loop(self, session: ProcessSession):
-        """Background thread: read stdout from a local Popen process."""
+        """Background thread: read stdout from a local Popen process.
+
+        IMPORTANT: avoid ``TextIOWrapper.read(4096)`` here. On pipes that call can
+        block until EOF (or a large buffer fills), which makes "live" output land
+        in one burst at process exit. ``buffer.read1(4096)`` yields incremental
+        chunks as bytes become available, then we decode to text.
+        """
         first_chunk = True
         try:
+            stdout = session.process.stdout
+            if stdout is None:
+                return
+
+            raw_read = getattr(getattr(stdout, "buffer", None), "read1", None)
             while True:
-                chunk = session.process.stdout.read(4096)
-                if not chunk:
-                    break
+                if raw_read is not None:
+                    raw = raw_read(4096)
+                    if not raw:
+                        break
+                    chunk = raw.decode("utf-8", errors="replace")
+                else:
+                    # Fallback for mocked/alternate streams without a buffered raw
+                    # interface. This may be less "live", but keeps compatibility.
+                    chunk = stdout.read(4096)
+                    if not chunk:
+                        break
+
                 if first_chunk:
                     chunk = self._clean_shell_noise(chunk)
                     first_chunk = False
@@ -916,6 +956,7 @@ class ProcessRegistry:
                     if len(session.output_buffer) > session.max_output_chars:
                         session.output_buffer = session.output_buffer[-session.max_output_chars:]
                 self._check_watch_patterns(session, chunk)
+                self._emit_output(session, chunk)
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
@@ -954,6 +995,7 @@ class ProcessRegistry:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
                         self._check_watch_patterns(session, delta)
+                        self._emit_output(session, delta)
 
                 # Check if process is still running
                 check = env.execute(
@@ -1002,6 +1044,7 @@ class ProcessRegistry:
                             if len(session.output_buffer) > session.max_output_chars:
                                 session.output_buffer = session.output_buffer[-session.max_output_chars:]
                         self._check_watch_patterns(session, text)
+                        self._emit_output(session, text)
                 except EOFError:
                     break
                 except Exception:
@@ -1105,14 +1148,33 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or session_id in self._poll_observed
 
-    def drain_notifications(self) -> "list[tuple[dict, str]]":
+    def drain_notifications(
+        self, session_key: str = "", owns_event=None,
+    ) -> "list[tuple[dict, str]]":
         """Pop all pending notification events and return formatted pairs.
 
         Returns a list of (raw_event, formatted_text) tuples.
         Skips completion events the agent already consumed via wait/log or
         observed inline via poll() (see ``_drain_should_skip``).
+
+        Async-delegation events carry a conversation payload, so draining one
+        into the wrong session is a cross-chat leak (#58684, #55578). Two
+        filter modes, strongest wins:
+
+        - ``owns_event(evt) -> bool``: positive-proof ownership callback.
+          When provided, an async-delegation event is consumed ONLY if the
+          callback returns True; everything else is re-queued for its owner.
+          The TUI passes its compression-chain-aware ownership check here so
+          a post-compression session still claims its own pre-compression
+          dispatches.
+        - ``session_key``: plain key equality (CLI and other single-session
+          callers). Non-matching async-delegation events are re-queued.
+
+        With neither set, all events are consumed (legacy single-session
+        behavior, backward compatible).
         """
-        results = []
+        results: "list[tuple[dict, str]]" = []
+        requeue: "list[dict]" = []
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
@@ -1121,9 +1183,28 @@ class ProcessRegistry:
             _evt_sid = evt.get("session_id", "")
             if evt.get("type") == "completion" and self._drain_should_skip(_evt_sid):
                 continue
+            # Filter async-delegation events so they are not delivered to the
+            # wrong session/thread (#58684). Positive-proof callback beats
+            # bare key equality when the caller can provide one.
+            if evt.get("type") == "async_delegation":
+                if owns_event is not None:
+                    try:
+                        owned = bool(owns_event(evt))
+                    except Exception:
+                        owned = False  # fail closed — never leak on a broken check
+                    if not owned:
+                        requeue.append(evt)
+                        continue
+                elif session_key:
+                    evt_session_key = evt.get("session_key", "") or ""
+                    if evt_session_key != session_key:
+                        requeue.append(evt)
+                        continue
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
+        for evt in requeue:
+            self.completion_queue.put(evt)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -1390,24 +1471,10 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process tree
-                try:
-                    if _IS_WINDOWS:
-                        session.process.terminate()
-                    else:
-                        import psutil
-                        try:
-                            parent = psutil.Process(session.process.pid)
-                            for child in parent.children(recursive=True):
-                                try:
-                                    child.terminate()
-                                except psutil.NoSuchProcess:
-                                    pass
-                            parent.terminate()
-                        except psutil.NoSuchProcess:
-                            pass
-                except (ProcessLookupError, PermissionError):
-                    session.process.kill()
+                # Local process -- kill the process tree. On Windows this
+                # must be taskkill /T /F; Popen.terminate() only kills the
+                # shell wrapper and leaves Git Bash descendants behind.
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -1482,6 +1549,37 @@ class ProcessRegistry:
     def submit_stdin(self, session_id: str, data: str = "") -> dict:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
         return self.write_stdin(session_id, data + "\n")
+
+    def request_close_terminal(self, session_id: str) -> dict:
+        """Ask the desktop GUI to close the read-only terminal tab mirroring this
+        background process.
+
+        This does NOT kill the process — it only drops the view. Output keeps
+        streaming into the (capped) buffer and the user can reopen the tab from
+        the status stack. Desktop-only: returns an error if no UI close sink is
+        wired (e.g. CLI / messaging)."""
+        sink = self.on_close
+        if sink is None:
+            return {
+                "status": "error",
+                "error": "close_terminal is only available in the Hermes desktop app.",
+            }
+        # The session may already be finished (or pruned) — the tab can still
+        # linger and be closed, so a missing session is not an error here.
+        session = self.get(session_id)
+        try:
+            sink(session, session_id)
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+        return {
+            "status": "ok",
+            "closed": session_id,
+            "note": (
+                "Closed the read-only terminal tab. The process was not killed; "
+                "its output remains available and the user can reopen the tab "
+                "from the status stack."
+            ),
+        }
 
     def close_stdin(self, session_id: str) -> dict:
         """Close a running process's stdin / send EOF without killing the process."""
