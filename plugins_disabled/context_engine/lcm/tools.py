@@ -1410,6 +1410,13 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
     model = engine._config.expansion_model or engine._config.summary_model or ""
     timeout = engine._config.expansion_timeout_ms / 1000
+    if getattr(engine._config, "deterministic_only", False):
+        # Model-free mode: never synthesize an LLM answer. Return the raw
+        # retrieved context so the agent's own model can read it directly.
+        return _degraded_payload(
+            "lcm_expand_query LLM synthesis disabled (deterministic_only); "
+            "returning raw retrieval context"
+        )
     try:
         answer = _synthesize_expansion_answer(
             prompt=prompt,
